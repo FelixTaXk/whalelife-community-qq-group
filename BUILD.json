@@ -1,0 +1,34 @@
+{
+  "version": "0.6.6",
+  "mode": "external",
+  "files": [
+    {
+      "sha256": "ba9d827be88edaff1e298dac05274026bed4f74046925dd76b4c1118f01cc8f1",
+      "path": "index.ts"
+    },
+    {
+      "sha256": "79735a75d0274d2a5dcc240d11a0f81e34cfc3533939b7fce8e84e35a150a238",
+      "path": "LICENSE"
+    },
+    {
+      "sha256": "25d0462f6602fc3330d0405f5556ad2f85f7868b981ed77f01cf8c94958ace16",
+      "path": "LICENSE-ADDITIONAL"
+    },
+    {
+      "sha256": "6571f1b603746d6affae18582eeed4e83bb4a604208400760feb8217b1834910",
+      "path": "NOTICE.md"
+    },
+    {
+      "sha256": "6ea6bf9e9770c131363cf4f9fe37a84af04ec6c46c4805d08e857bda23417f71",
+      "path": "plugin.yaml"
+    },
+    {
+      "sha256": "1d37e4dbea35e90f02b64ac9190db280aa0635029a4d64d808b6c6b6e47975bb",
+      "path": "README.md"
+    },
+    {
+      "sha256": "1a49fe38bf3eaebb7eaee5c981da1ea5a565c11650a0306695cd60841742d0a1",
+      "path": "THIRD_PARTY_NOTICES.md"
+    }
+  ]
+}
