@@ -990,7 +990,7 @@ class GroupRuntime {
         const sent = await this.sendVoice(groupId, text, signal, true, segmentActionId(baseActionId, "voice-replace"));
         this.storeSendReceipt(message.deliveryId, sent);
         if (!replyTo) this.markSpoken(groupId);
-        return;
+        return { ...sent, deliveryId: message.deliveryId };
       } catch (error) {
         this.noteVoiceFailed(groupId);
         const kind = deliveryErrorKind(error);
@@ -1017,7 +1017,8 @@ class GroupRuntime {
       textSegments.push(String(result.messageId));
     }
     this.noteText(groupId);
-    this.storeSendReceipt(message.deliveryId, { status: "sent", confirmed: true, messageId: textSegments[0], messageIds: textSegments });
+    const receipt = { status: "sent", confirmed: true, groupId, messageId: textSegments[0], messageIds: textSegments, deliveryId: message.deliveryId };
+    this.storeSendReceipt(message.deliveryId, receipt);
     if (due) {
       try {
         await this.sendVoice(groupId, text, signal, true, segmentActionId(baseActionId, "voice-extra"));
@@ -1031,6 +1032,7 @@ class GroupRuntime {
       }
     }
     if (!replyTo) this.markSpoken(groupId);
+    return receipt;
   }
 
   voiceService() {
