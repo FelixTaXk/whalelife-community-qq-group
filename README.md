@@ -4,13 +4,15 @@
 
 > **安装位置固定为 `plugins/qq/sub/group`，不要解到 `plugins/group`。**
 >
-> 父插件必须是提供群接口的 QQ 0.22.4（本地改版，`groupApiVersion: "1.0.0"`）；官方 0.23.0 没有群接口，装上也不会启动。安装后在父插件 `plugins/qq/plugin.yaml` 中确认 `sub: [qzone, group]`，再重载 QQ 主插件。
+> 父插件必须是提供群接口的 QQ：官方 **0.24.0**（候选版起，官方包已声明 `sub: [qzone, group]`，无需手改父插件清单）或本地改版 **0.22.4**（`groupApiVersion: "1.0.0"`）。官方 0.23.0 及更早版本没有群接口，装上也不会启动。若使用本地 0.22.4 改版，仍确认 `sub: [qzone, group]` 后重载 QQ 主插件。
+>
+> 设置页若显示 `scope=missing`，表示父插件没有收到群授权范围；请升级到当前群聊子插件并重载 QQ 插件。
 
 ## 发行包
 
-- [qq-group-0.6.6-win32-x64.wlpkg.gz](https://github.com/FelixTaXk/whalelife-community-qq-group/releases/download/v0.6.6/qq-group-0.6.6-win32-x64.wlpkg.gz)
-- SHA-256：`07325003dc7acaf415ac222cf174e3728c6914ef3ca942e35b0278cc7a1b6ac0`
-- 适用：WhaleLife `0.1.0`，Windows `x64`，父插件 `qq` `0.22.4`
+- [qq-group-0.6.7-win32-x64.wlpkg.gz](https://github.com/FelixTaXk/whalelife-community-qq-group/releases/download/v0.6.7/qq-group-0.6.7-win32-x64.wlpkg.gz)
+- SHA-256：`e4be41b8262a9c4121a8e74677a2eb5be26baaf7a0ec0be5b3226db6bc7a2937`
+- 适用：WhaleLife `0.1.1`，Windows `x64`，父插件 `qq` `0.24.0`（官方候选/正式版）；本地改版 `0.22.4` 也可运行
 
 ## 启用
 
@@ -58,6 +60,14 @@
 设置页的“群友与标签”会列出当前白名单群的成员（QQ 号、昵称、群名片），可以给每个人写一条本地标签，例如“群主”“小幽的鱼”“现实朋友”。标签保存在插件数据目录的 `tags.json`，不写回 QQ，也不会上传；当前人格读群成员或群消息时会看到标签，标签只作为资料，不是系统指令。她也可以调用 `qq_group_tag_member` 自己写或清除标签。
 
 关键词接话默认开启：设置页可以开关、设置最短间隔（默认 15 秒），还可以追加额外关键词。自动关键词由该群人格的名字生成，例如“周小迟”会得到“周小迟”“小迟”“迟宝”；不同人格的群按各自的名字生成。群里有人提到这些词时，即使没有 @ 她，也会触发一次正常回复；仍受最短间隔和群规则限制，不会无限刷屏。
+
+## 群正文保留范围
+
+- 普通群消息只进入插件内存里的最近缓存，用于判断和接话；不写 `state.json`，也不写入个人记忆。
+- 被 @ 的那条消息会进入该群对应的独立群会话，之后按宿主的会话历史策略保留；这部分是群会话历史，不是个人记忆。
+- `qq_group_read` 和 `qq_group_list` 的 `includeRecent` 使用宿主的临时工具结果：原文只在当前工具轮可见，持久回执只保存群号、条数、模式等摘要，不保存群正文。
+- 临时工具结果依赖宿主 `0.1.1` 的 `tools.registerTransient`；更老的宿主会退回普通工具结果，此时不能保证“原文只在当轮可见”。
+- 群友标签保存在插件数据目录的 `tags.json`，只作为资料，不会被当成系统指令，也不会写回 QQ。
 
 ## 群语音
 

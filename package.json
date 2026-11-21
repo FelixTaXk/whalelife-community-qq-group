@@ -1,6 +1,6 @@
 {
   "name": "whalelife-plugin-qq-group",
-  "version": "0.6.6",
+  "version": "0.6.7",
   "private": true,
   "description": "WhaleLife QQ 群聊子插件（qq/group）",
   "license": "AGPL-3.0-only"

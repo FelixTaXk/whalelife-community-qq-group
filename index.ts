@@ -105,6 +105,44 @@ function splitReply(text, max = 1200, options = {}) {
   return blocks.filter(Boolean);
 }
 
+function normalizeActionId(value, fallback) {
+  const text = String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
+  return (text || fallback).slice(0, 128);
+}
+function segmentActionId(base, suffix) {
+  return `${String(base).slice(0, 100)}:${suffix}`.slice(0, 128);
+}
+function validReceiptId(value) {
+  return typeof value === "string" && /^-?[1-9]\d{0,19}$/.test(value);
+}
+function receiptIds(result) {
+  const ids = [];
+  if (validReceiptId(result?.messageId)) ids.push(String(result.messageId));
+  if (Array.isArray(result?.messageIds)) {
+    for (const value of result.messageIds) if (validReceiptId(value)) ids.push(String(value));
+  }
+  return [...new Set(ids)];
+}
+function confirmedSend(result) {
+  return result?.status === "sent" && result?.confirmed === true && receiptIds(result).length > 0;
+}
+class GroupSendError extends Error {
+  kind: string;
+  result: any;
+  constructor(message, kind = "uncertain", result = null) {
+    super(message);
+    this.name = "GroupSendError";
+    this.kind = kind;
+    this.result = result;
+  }
+}
+function deliveryErrorKind(error, fallback = "uncertain") {
+  const code = String(error?.code ?? error?.kind ?? error?.status ?? "").toLowerCase();
+  if (code === "not_submitted" || code === "uncertain") return code;
+  if (["offline", "input", "size", "image", "voice", "cancelled", "aborted"].includes(code)) return "not_submitted";
+  return fallback;
+}
+
 function stripSendReceipt(text) {
   const normalized = String(text ?? "").replace(/\r\n?/g, "\n").trim();
   if (!normalized) return "";
@@ -377,7 +415,10 @@ class GroupRuntime {
       this.ctx.logger.warn("QQ 群聊默认人格渠道接入失败", { error: error instanceof Error ? error.message : "unknown" });
       return;
     }
-    this.unregister = this.qq.registerGroupReceiver((event) => this.onEvent(event), { signal: this.ctx.signal });
+    this.unregister = this.qq.registerGroupReceiver((event) => this.onEvent(event), {
+      signal: this.ctx.signal,
+      allowsGroup: (groupId) => this.config.enabled && Boolean(this.ruleFor(String(groupId ?? "")))
+    });
     void this.refreshNames();
     this.watch();
   }
@@ -386,6 +427,24 @@ class GroupRuntime {
     if (this.watchTimer) return;
     this.watchTimer = setInterval(() => this.checkService(), 30000);
     this.watchTimer.unref?.();
+  }
+
+  bindReceiver(service = this.qq) {
+    this.unregister?.();
+    this.unregister = void 0;
+    if (!service || typeof service.registerGroupReceiver !== "function") return;
+    this.unregister = service.registerGroupReceiver((event) => this.onEvent(event), {
+      signal: this.ctx.signal,
+      allowsGroup: (groupId) => this.config.enabled && Boolean(this.ruleFor(String(groupId ?? "")))
+    });
+  }
+
+  clearAccountCache() {
+    this.members.clear();
+    this.buffers.clear();
+    this.groupNames.clear();
+    this.followups.clear();
+    this.keywordAt.clear();
   }
 
   checkService() {
@@ -398,19 +457,28 @@ class GroupRuntime {
     }
     if (!current || current.groupApiVersion !== "1.0.0") return;
     const selfId = current.getSelfId?.() || "";
-    if (/^[1-9]\d{4,19}$/.test(selfId) && selfId !== this.selfId) {
-      this.selfId = selfId;
+    const nextId = /^[1-9]\d{4,19}$/.test(selfId) ? selfId : "";
+    const changedAccount = Boolean(nextId && nextId !== this.selfId);
+    if (changedAccount) {
+      this.selfId = nextId;
+      this.clearAccountCache();
+      this.closeChannels();
       const persona = this.personaId();
       if (persona) {
-        this.closeChannels();
-        this.openChannel(persona);
+        try {
+          this.openChannel(persona);
+        } catch (error) {
+          this.ctx.logger.warn("QQ 群聊切号后默认人格渠道接入失败", {
+            error: error instanceof Error ? error.message : "unknown"
+          });
+        }
       }
     }
-    if (current === this.qq) return;
+    if (current === this.qq && !changedAccount) return;
     this.qq = current;
-    this.unregister?.();
-    this.unregister = current.registerGroupReceiver((event) => this.onEvent(event), { signal: this.ctx.signal });
-    this.ctx.logger.info("QQ 群聊已跟随 QQ 插件重载。");
+    this.bindReceiver(current);
+    void this.refreshNames();
+    this.ctx.logger.info(changedAccount ? "QQ 群聊已按新账号重绑群接收器" : "QQ 群聊已跟随 QQ 插件重载");
   }
 
   personas() {
@@ -745,6 +813,7 @@ class GroupRuntime {
       peer,
       sender: event.sender,
       messageId: event.messageId,
+      actionId: "group-auto:" + difference(event.groupId, event.messageId || event.fingerprint || `${event.sender}:${event.at ?? ""}`),
       ...(quote ? { replyTo: quote } : {}),
       text: String(event.text || "").slice(0, MAX_TEXT),
       senderProfile: {
@@ -863,6 +932,10 @@ class GroupRuntime {
     const replyTo = typeof message.replyTo === "string" ? message.replyTo : "";
     const rawText = String(message.text ?? "");
     const text = stripSendReceipt(rawText);
+    const baseActionId = normalizeActionId(
+      message.actionId,
+      "group-channel:" + difference(groupId, message.deliveryId || message.messageId || "")
+    );
     const chunks = splitReply(text, this.config.maxChars, {
       paragraph: this.config.splitParagraphs,
       maxSegments: this.config.maxSegments,
@@ -877,29 +950,43 @@ class GroupRuntime {
     const replace = due && voice.mode === "replace" && Array.from(text).length <= voice.maxChars;
     if (replace) {
       try {
-        await this.sendVoice(groupId, text, signal);
+        await this.sendVoice(groupId, text, signal, true, segmentActionId(baseActionId, "voice-replace"));
         if (!replyTo) this.markSpoken(groupId);
         return;
       } catch (error) {
         this.noteVoiceFailed(groupId);
+        const kind = deliveryErrorKind(error);
+        if (kind !== "not_submitted") {
+          if (!this.ctx.signal.aborted)
+            this.ctx.logger.warn("QQ 群语音结果未知，未改发文字，避免重复", {
+              groupId, actionId: segmentActionId(baseActionId, "voice-replace"), error: error instanceof Error ? error.message : "unknown"
+            });
+          throw error instanceof GroupSendError ? error : new GroupSendError("群语音结果未知，请核对回执。", kind, error);
+        }
         if (!this.ctx.signal.aborted)
-          this.ctx.logger.warn("QQ 群语音发送失败，改发文字", { groupId, error: error instanceof Error ? error.message : "unknown" });
+          this.ctx.logger.warn("QQ 群语音未提交，改发文字", { groupId, error: error instanceof Error ? error.message : "unknown" });
       }
     }
     for (const [index, chunk] of chunks.entries()) {
       signal.throwIfAborted();
-      const result = await this.qq.sendGroupText({ groupId, text: chunk, ...(index === 0 && replyTo ? { replyTo } : {}) }, { signal });
+      const segmentId = segmentActionId(baseActionId, `text-${index}`);
+      const result = await this.qq.sendGroupText({ groupId, text: chunk, actionId: segmentId, ...(index === 0 && replyTo ? { replyTo } : {}) }, { signal });
+      if (!confirmedSend(result)) {
+        throw new GroupSendError("群消息未获得平台确认，请核对回执。", result?.status === "not_submitted" ? "not_submitted" : "uncertain", result);
+      }
       this.rememberSelf(groupId, chunk);
-      if (result.status !== "sent") throw new Error("群消息未获得平台确认，请核对回执。");
     }
     this.noteText(groupId);
     if (due) {
       try {
-        await this.sendVoice(groupId, text, signal);
+        await this.sendVoice(groupId, text, signal, true, segmentActionId(baseActionId, "voice-extra"));
       } catch (error) {
         this.noteVoiceFailed(groupId);
         if (!this.ctx.signal.aborted)
-          this.ctx.logger.warn("QQ 群语音发送失败，本条只发了文字", { groupId, error: error instanceof Error ? error.message : "unknown" });
+          this.ctx.logger.warn(
+            deliveryErrorKind(error) === "not_submitted" ? "QQ 群语音未提交，本条只发了文字" : "QQ 群语音结果未知，请核对回执",
+            { groupId, actionId: segmentActionId(baseActionId, "voice-extra"), error: error instanceof Error ? error.message : "unknown" }
+          );
       }
     }
     if (!replyTo) this.markSpoken(groupId);
@@ -981,15 +1068,40 @@ class GroupRuntime {
     });
   }
 
-  async sendVoice(groupId, text, signal, track = true) {
+  async sendVoice(groupId, text, signal, track = true, actionId = "") {
     const service = this.voiceService();
     if (!service?.synthesize) throw new Error("语音插件未接入，群语音发不出去。");
     const speech = this.speechText(text);
     if (!speech) throw new Error("这条内容没有可朗读的文字。");
     const audio = await service.synthesize({ text: speech }, { signal: AbortSignal.any([signal, AbortSignal.timeout(180000)]) });
     if (!audio?.base64 || !audio?.mime) throw new Error("语音合成没有返回音频。");
-    const result = await this.qq.sendGroupMedia({ groupId, parts: [{ type: "voice", base64: audio.base64, mime: audio.mime }] }, { signal });
-    if (result.status !== "sent") throw new Error(result.error || "群语音未获得平台确认。");
+    const stableActionId = segmentActionId(
+      normalizeActionId(actionId, "group-voice:" + difference(groupId, randomUUID())),
+      "voice"
+    );
+    let result;
+    try {
+      result = await this.qq.sendGroupMedia({
+        groupId,
+        parts: [{ type: "voice", base64: audio.base64, mime: audio.mime }],
+        actionId: stableActionId
+      }, { signal });
+    } catch (error) {
+      throw error instanceof GroupSendError
+        ? error
+        : new GroupSendError(
+            error instanceof Error ? error.message : "群语音未获得平台确认。",
+            deliveryErrorKind(error),
+            error
+          );
+    }
+    if (!confirmedSend(result)) {
+      throw new GroupSendError(
+        result?.status === "not_submitted" ? "群语音未提交。" : (result?.error || "群语音结果未知，请核对回执。"),
+        result?.status === "not_submitted" ? "not_submitted" : "uncertain",
+        result
+      );
+    }
     if (track) {
       this.rememberSelf(groupId, `【语音】${speech}`);
       this.noteVoice(groupId);
@@ -1015,6 +1127,7 @@ class GroupRuntime {
     return {
       accountId: status.accountId || this.selfId || null,
       online: status.online === true,
+      scope: typeof status.scope === "string" ? status.scope : "",
       channel: this.hasChannel() ? "ready" : "off",
       voiceReady: !!this.voiceService()?.synthesize,
       groups: this.config.groups.map((rule) => {
@@ -1055,7 +1168,7 @@ function toolError(error) {
 export async function apply(ctx) {
   const qq = ctx.get("qq");
   if (!qq || qq.groupApiVersion !== "1.0.0" || typeof qq.registerGroupReceiver !== "function")
-    throw Error("QQ 群聊需要 QQ 插件提供群消息接口（QQ 0.22.0 及兼容版本）。");
+    throw Error("QQ 群聊需要 QQ 插件提供群消息接口（QQ 0.22.4 本地改版或官方 0.24.0 及兼容版本）。");
   const runtime = new GroupRuntime(ctx, qq);
   await runtime.load();
   if (typeof ctx.optional === "function") {
@@ -1076,6 +1189,19 @@ export async function apply(ctx) {
   });
 
   const signalOf = (session) => session.signal ? AbortSignal.any([ctx.signal, session.signal]) : ctx.signal;
+  const registerReadTool = (tool) => {
+    if (typeof ctx.tools.registerTransient === "function") {
+      ctx.tools.registerTransient(tool);
+      return;
+    }
+    ctx.tools.register({
+      ...tool,
+      run: async (...args) => {
+        const value = await tool.run(...args);
+        return value && typeof value === "object" && "content" in value ? value.content : value;
+      }
+    });
+  };
   const ruleOrThrow = (groupId) => {
     const rule = runtime.ruleFor(groupIdOf(groupId));
     if (!rule) throw new Error("这个群还没有加入群聊白名单。");
@@ -1117,13 +1243,32 @@ export async function apply(ctx) {
         });
         const messageIds = [];
         for (let index = 0; index < chunks.length; index++) {
+          const segmentId = segmentActionId(actionId, `text-${index}`);
           try {
-            const sent = await runtime.qq.sendGroupText({ groupId: group, text: chunks[index], atUserIds: index === 0 ? targets : [], ...(index === 0 && quote ? { replyTo: quote } : {}) }, { signal: signalOf(session) });
+            const sent = await runtime.qq.sendGroupText({ groupId: group, text: chunks[index], actionId: segmentId, atUserIds: index === 0 ? targets : [], ...(index === 0 && quote ? { replyTo: quote } : {}) }, { signal: signalOf(session) });
+            if (!confirmedSend(sent)) {
+              const error = new GroupSendError(
+                sent?.status === "not_submitted" ? "群消息未提交。" : "群消息未获得平台确认，请核对回执。",
+                sent?.status === "not_submitted" ? "not_submitted" : "uncertain",
+                sent
+              );
+              if (!messageIds.length) return { status: error.kind, confirmed: false, groupId: group, actionId: segmentId, error: error.message, retryAutomatically: false };
+              return { status: "partial", confirmed: false, groupId: group, messageIds, actionId: segmentId, error: error.message, retryAutomatically: false };
+            }
             messageIds.push(sent.messageId);
             runtime.rememberSelf(group, chunks[index]);
           } catch (error) {
-            if (!messageIds.length) throw error;
-            return { status: "partial", confirmed: false, groupId: group, messageIds, error: error instanceof Error ? error.message : String(error), retryAutomatically: false };
+            if (!messageIds.length) {
+              return {
+                status: deliveryErrorKind(error),
+                confirmed: false,
+                groupId: group,
+                actionId: segmentId,
+                error: error instanceof Error ? error.message : String(error),
+                retryAutomatically: false
+              };
+            }
+            return { status: "partial", confirmed: false, groupId: group, messageIds, actionId: segmentId, error: error instanceof Error ? error.message : String(error), retryAutomatically: false };
           }
         }
         runtime.markSpoken(group);
@@ -1137,21 +1282,23 @@ export async function apply(ctx) {
     const result = await runtime.channelFor(rule).send({
       peer,
       messageId: `${transient ? "chime" : "say"}:${difference(session.id, actionId)}`,
+      actionId,
       ...(quote ? { replyTo: quote } : {}),
       text: body
     }, { signal: signalOf(session) });
+    const confirmed = result.status === "sent" && validReceiptId(result.messageId);
     return {
-      status: result.status,
-      confirmed: result.status === "sent",
+      status: confirmed ? "sent" : "uncertain",
+      confirmed,
       groupId: group,
       messageId: result.messageId,
       ...(quote ? { replyTo: quote } : {}),
-      ...(result.status === "sent" ? {} : { error: result.error || "未获得平台确认，请核对回执。" }),
+      ...(confirmed ? {} : { error: result.error || "未获得平台确认，请核对回执。" }),
       retryAutomatically: false
     };
   };
 
-  ctx.tools.register({
+  registerReadTool({
     name: "qq_group_list",
     danger: "safe",
     origin: { platform: CHANNEL_NAME, action: "查看群聊接入" },
@@ -1170,23 +1317,32 @@ export async function apply(ctx) {
         if (Object.keys(input).some((key) => !["includeRecent", "limit"].includes(key))) throw new Error("参数无效。");
         const limit = Math.round(clampNumber(input.limit, 1, 20, 6));
         const snapshot = runtime.snapshot();
+        const groups = snapshot.groups.map((group) => ({
+          ...group,
+          ...(input.includeRecent === true ? { recent: runtime.bufferOf(group.groupId).slice(-limit).map((row) => ({ self: row.self === true, ...(row.self === true ? {} : { messageId: row.id, tag: runtime.tagOf(group.groupId, row.sender) }), name: row.name, text: row.text })) } : {})
+        }));
         return {
-          status: "ready",
-          enabled: runtime.config.enabled,
-          ...snapshot,
-          proactive: runtime.config.proactive.enabled,
-          groups: snapshot.groups.map((group) => ({
-            ...group,
-            ...(input.includeRecent === true ? { recent: runtime.bufferOf(group.groupId).slice(-limit).map((row) => ({ self: row.self === true, ...(row.self === true ? {} : { messageId: row.id, tag: runtime.tagOf(group.groupId, row.sender) }), name: row.name, text: row.text })) } : {})
-          }))
+          content: {
+            status: "ready",
+            enabled: runtime.config.enabled,
+            ...snapshot,
+            proactive: runtime.config.proactive.enabled,
+            groups
+          },
+          receipt: {
+            status: "ready",
+            enabled: runtime.config.enabled,
+            groupCount: groups.length,
+            groups: groups.map((group) => ({ groupId: group.groupId, mode: group.mode, messages: group.messages, todaySpoke: group.todaySpoke }))
+          }
         };
       } catch (error) {
-        return toolError(error);
+        return { content: toolError(error), receipt: { status: "blocked", confirmed: false, error: error instanceof Error ? error.message : "群聊读取未完成。" } };
       }
     }
   });
 
-  ctx.tools.register({
+  registerReadTool({
     name: "qq_group_read",
     danger: "safe",
     origin: { platform: CHANNEL_NAME, action: "读取群内最近消息" },
@@ -1208,15 +1364,25 @@ export async function apply(ctx) {
         if (!groupId) groupId = runtime.config.groups[0]?.groupId || "";
         if (!groupId) throw new Error("还没有配置任何群。");
         const rule = ruleOrThrow(groupId);
+        const messages = runtime.bufferOf(groupId).slice(-limit).map((row) => ({ self: row.self === true, ...(row.self === true ? {} : { messageId: row.id, tag: runtime.tagOf(groupId, row.sender) }), name: row.name, text: row.text }));
         return {
-          status: "ready",
-          groupId,
-          name: rule.name || runtime.groupNames.get(groupId) || "",
-          mode: rule.mode,
-          messages: runtime.bufferOf(groupId).slice(-limit).map((row) => ({ self: row.self === true, ...(row.self === true ? {} : { messageId: row.id, tag: runtime.tagOf(groupId, row.sender) }), name: row.name, text: row.text }))
+          content: {
+            status: "ready",
+            groupId,
+            name: rule.name || runtime.groupNames.get(groupId) || "",
+            mode: rule.mode,
+            messages
+          },
+          receipt: {
+            status: "ready",
+            groupId,
+            name: rule.name || runtime.groupNames.get(groupId) || "",
+            mode: rule.mode,
+            count: messages.length
+          }
         };
       } catch (error) {
-        return toolError(error);
+        return { content: toolError(error), receipt: { status: "blocked", confirmed: false, error: error instanceof Error ? error.message : "群聊读取未完成。" } };
       }
     }
   });
@@ -1370,8 +1536,17 @@ export async function apply(ctx) {
       parts.push({ type: "image", base64: media.base64, mime: media.mime, asMeme: false });
     }
     const promise = (async () => {
-      const result = await runtime.qq.sendGroupMedia({ groupId, parts }, { signal: signalOf(session) });
-      return { ...result, groupId, confirmed: result.status === "sent", retryAutomatically: false };
+      const mediaActionId = segmentActionId(actionId, "image");
+      const result = await runtime.qq.sendGroupMedia({ groupId, parts, actionId: mediaActionId }, { signal: signalOf(session) });
+      const confirmed = confirmedSend(result);
+      return {
+        ...result,
+        groupId,
+        confirmed,
+        actionId: mediaActionId,
+        ...(confirmed ? {} : { error: result?.error || "群图文未获得平台确认，请核对回执。" }),
+        retryAutomatically: false
+      };
     })();
     imageActions.set(key, promise);
     promise.catch(() => {
@@ -1552,7 +1727,7 @@ td button{padding:4px 8px;font-size:12px}
   const readGroups=()=>byId("groupsText").value.split("\n").map(line=>line.trim()).filter(line=>line&&!line.startsWith("#")).map(line=>{const parts=line.split(/\s+/);const rest=parts.slice(2);const at=rest.findIndex(t=>t.startsWith("@"));const personaId=at>=0?rest[at].slice(1):"";const name=rest.filter((_,i)=>i!==at).join(" ");return {groupId:parts[0],mode:parts[1]||"mention",...(name?{name}:{}),...(personaId?{personaId}:{})}});
   const fill=(config,personas)=>{roster=personas||[];byId("enabled").checked=config.enabled;byId("replyOnAt").checked=config.replyOnAt;byId("replyOnAtAll").checked=config.replyOnAtAll===true;byId("replyOnPoke").checked=config.replyOnPoke!==false;byId("replyOnKeyword").checked=config.replyOnKeyword!==false;byId("keywordCooldownSeconds").value=config.keywordCooldownSeconds??15;byId("keywordsText").value=(config.keywords||[]).join("，");const byPersona=config.autoKeywordsByPersona||{};const keywordLines=roster.map(p=>p.name+"："+((byPersona[p.id]||[]).join("、")||"（没有可用简称）"));byId("keywordAuto").textContent=(keywordLines.length?"自动关键词（按人格）："+keywordLines.join("；"):"自动关键词："+((config.autoKeywords||[]).join("、")||"（当前人格没有可用简称）"))+"；保存设置后立即生效。";byId("followupSeconds").value=config.followupSeconds??10;byId("permission").value=config.permission;const sel=byId("personaId");sel.replaceChildren(new Option("使用默认人格",""),...personas.map(p=>new Option(p.name,p.id)));sel.value=config.personaId||"";byId("groupsText").value=groupsToText(config.groups);const gsel=byId("voiceTestGroup");const prevGroup=gsel.value;gsel.replaceChildren(...(config.groups.length?config.groups.map(g=>new Option(g.name?g.name+"（"+g.groupId+"）":g.groupId,g.groupId)):[new Option("先添加群规则","")]));if(prevGroup&&config.groups.some(g=>g.groupId===prevGroup))gsel.value=prevGroup;const msel=byId("memberGroup");const prevMember=msel.value;msel.replaceChildren(...(config.groups.length?config.groups.map(g=>new Option(g.name?g.name+"（"+g.groupId+"）":g.groupId,g.groupId)):[new Option("先添加群规则","")]));msel.value=prevMember&&config.groups.some(g=>g.groupId===prevMember)?prevMember:(config.groups[0]?.groupId||"");byId("contextSize").value=config.contextSize;byId("maxChars").value=config.maxChars;byId("splitParagraphs").checked=config.splitParagraphs!==false;byId("maxSegments").value=config.maxSegments||6;byId("protectRegex").value=config.protectRegex||"";const v=config.voice||{};byId("voiceEnabled").checked=v.enabled===true;byId("voiceTrigger").value=v.trigger||"count";byId("voiceEvery").value=v.every??8;byId("voiceMode").value=v.mode||"extra";byId("voiceMinGap").value=v.minGapSec??60;byId("voiceMaxChars").value=v.maxChars??200;const p=config.proactive;byId("proEnabled").checked=p.enabled;byId("probability").value=p.probability;byId("cooldownMin").value=Math.round(p.cooldownMs/60000);byId("dailyLimit").value=p.dailyLimit;byId("quietStart").value=p.quietStart;byId("quietEnd").value=p.quietEnd;byId("debounceSec").value=Math.round(p.debounceMs/1000);byId("minMessages").value=p.minMessages};
   const collect=()=>({schemaVersion:1,enabled:byId("enabled").checked,personaId:byId("personaId").value,permission:byId("permission").value,replyOnAt:byId("replyOnAt").checked,replyOnAtAll:byId("replyOnAtAll").checked,replyOnPoke:byId("replyOnPoke").checked,replyOnKeyword:byId("replyOnKeyword").checked,keywordCooldownSeconds:Number(byId("keywordCooldownSeconds").value),keywords:byId("keywordsText").value.split(/[，,]/).map(x=>x.trim()).filter(Boolean),groups:readGroups(),contextSize:Number(byId("contextSize").value),maxChars:Number(byId("maxChars").value),splitParagraphs:byId("splitParagraphs").checked,maxSegments:Number(byId("maxSegments").value),protectRegex:byId("protectRegex").value,followupSeconds:Number(byId("followupSeconds").value),voice:{enabled:byId("voiceEnabled").checked,trigger:byId("voiceTrigger").value,every:Number(byId("voiceEvery").value),mode:byId("voiceMode").value,minGapSec:Number(byId("voiceMinGap").value),maxChars:Number(byId("voiceMaxChars").value)},proactive:{enabled:byId("proEnabled").checked,probability:Number(byId("probability").value),cooldownMs:Number(byId("cooldownMin").value)*60000,dailyLimit:Number(byId("dailyLimit").value),quietStart:byId("quietStart").value,quietEnd:byId("quietEnd").value,debounceMs:Number(byId("debounceSec").value)*1000,minMessages:Number(byId("minMessages").value)}});
-  const renderStatus=(v)=>{const lines=["状态："+(v.online?"QQ 在线":"QQ 离线")+" · 账号 "+(v.accountId||"—")+" · 接入 "+(v.channel==="ready"?"就绪":"未就绪")+" · 语音 "+(v.voiceReady?"已接入":"未接入")];for(const g of v.groups||[])lines.push("· "+(g.name||"未命名")+"（"+g.groupId+"） "+g.mode+(g.personaName?" · 人格 "+g.personaName:"")+" · 缓存 "+g.messages+" 条 · 今日主动 "+g.todaySpoke+" · 今日语音 "+g.todayVoice+(g.pendingVoice?" · 待语音 "+g.pendingVoice:""));byId("status").textContent=lines.join("\n")};
+  const renderStatus=(v)=>{const lines=[];if(v.scope==="missing")lines.push("⚠ 父插件未收到群授权范围（scope=missing）：请升级 QQ 群聊子插件并重载 QQ 插件。");lines.push("状态："+(v.online?"QQ 在线":"QQ 离线")+" · 账号 "+(v.accountId||"—")+" · 接入 "+(v.channel==="ready"?"就绪":"未就绪")+" · 语音 "+(v.voiceReady?"已接入":"未接入"));for(const g of v.groups||[])lines.push("· "+(g.name||"未命名")+"（"+g.groupId+"） "+g.mode+(g.personaName?" · 人格 "+g.personaName:"")+" · 缓存 "+g.messages+" 条 · 今日主动 "+g.todaySpoke+" · 今日语音 "+g.todayVoice+(g.pendingVoice?" · 待语音 "+g.pendingVoice:""));byId("status").textContent=lines.join("\n")};
   const renderGroups=(groups)=>{
     const body=byId("groupList");
     body.replaceChildren();
