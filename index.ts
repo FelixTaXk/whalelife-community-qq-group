@@ -44,22 +44,34 @@ function groupOf(peer) {
   if (typeof peer !== "string" || !peer.startsWith("group:")) throw new Error("群会话标识无效。");
   return groupIdOf(peer.slice(6));
 }
-function splitText(text, max = 1200) {
+function splitText(text, max = 1200, paragraph = false) {
   const chars = Array.from(String(text ?? ""));
   const chunks = [];
   while (chars.length) {
     let end = Math.min(max, chars.length);
     if (end < chars.length) {
-      const newline = chars.lastIndexOf("\n", end - 1);
-      if (newline >= Math.floor(max / 2)) end = newline + 1;
+      let cut = -1;
+      if (paragraph) {
+        const prefix = chars.slice(0, end).join("");
+        const breaks = /\n\s*\n/g;
+        let match;
+        while ((match = breaks.exec(prefix))) {
+          if (match.index >= Math.floor(max / 2)) cut = match.index + 1;
+        }
+      }
+      if (cut < 0) {
+        const newline = chars.lastIndexOf("\n", end - 1);
+        if (newline >= Math.floor(max / 2)) cut = newline + 1;
+      }
+      if (cut >= 0) end = cut;
     }
-    chunks.push(chars.splice(0, end).join("").trim());
+    chunks.push(chars.splice(0, end).join(""));
   }
-  return chunks.filter(Boolean);
+  return chunks;
 }
 function splitReply(text, max = 1200, options = {}) {
-  const normalized = String(text ?? "").replace(/\r\n?/g, "\n").trim();
-  if (!normalized) return [];
+  const normalized = String(text ?? "").replace(/\r\n?/g, "\n");
+  if (!normalized.trim()) return [];
   let protect = null;
   if (options.protectRegex) {
     try {
@@ -68,28 +80,15 @@ function splitReply(text, max = 1200, options = {}) {
     }
   }
   let blocks;
-  if (options.paragraph === false) {
-    blocks = protect && protect.test(normalized)
-      ? Array.from(normalized).length <= 4000 ? [normalized] : splitText(normalized, max)
-      : splitText(normalized, max);
-  } else {
-    blocks = normalized.split(/\n\s*\n+/);
-    const length = Array.from(normalized).length;
-    if (blocks.length === 1 && length > max * 0.3 && (normalized.match(/\n/g) || []).length >= 2) blocks = normalized.split(/\n+/);
-    blocks = blocks.flatMap((block) => {
-      const value = block.trim();
-      if (!value) return [];
-      if (protect && protect.test(value))
-        return Array.from(value).length <= 4000 ? [value] : splitText(value, max);
-      return splitText(value, max);
-    }).filter(Boolean);
-  }
+  const length = Array.from(normalized).length;
+  if (protect && protect.test(normalized) && length <= 4000) blocks = [normalized];
+  else blocks = splitText(normalized, max, options.paragraph !== false);
   const limit = Math.max(1, Math.min(12, Math.round(Number(options.maxSegments) || 6)));
   while (blocks.length > limit) {
     let best = -1;
     let bestLength = Infinity;
     for (let index = 0; index + 1 < blocks.length; index++) {
-      const merged = Array.from(blocks[index]).length + Array.from(blocks[index + 1]).length + 1;
+      const merged = Array.from(blocks[index]).length + Array.from(blocks[index + 1]).length;
       if (merged <= max && merged < bestLength) {
         best = index;
         bestLength = merged;
@@ -102,7 +101,7 @@ function splitReply(text, max = 1200, options = {}) {
     const last = blocks.pop();
     blocks[blocks.length - 1] += last;
   }
-  return blocks.filter(Boolean);
+  return blocks;
 }
 
 function normalizeActionId(value, fallback) {
@@ -984,6 +983,7 @@ class GroupRuntime {
     }
     const voice = this.config.voice;
     const due = this.voiceDue(groupId);
+    let voiceDegraded = false;
     const replace = due && voice.mode === "replace" && Array.from(text).length <= voice.maxChars;
     if (replace) {
       try {
@@ -1003,6 +1003,7 @@ class GroupRuntime {
         }
         if (!this.ctx.signal.aborted)
           this.ctx.logger.warn("QQ 群语音未提交，改发文字", { groupId, error: error instanceof Error ? error.message : "unknown" });
+        voiceDegraded = true;
       }
     }
     const textSegments = [];
@@ -1019,7 +1020,7 @@ class GroupRuntime {
     this.noteText(groupId);
     const receipt = { status: "sent", confirmed: true, groupId, messageId: textSegments[0], messageIds: textSegments, deliveryId: message.deliveryId };
     this.storeSendReceipt(message.deliveryId, receipt);
-    if (due) {
+    if (due && !voiceDegraded) {
       try {
         await this.sendVoice(groupId, text, signal, true, segmentActionId(baseActionId, "voice-extra"));
       } catch (error) {

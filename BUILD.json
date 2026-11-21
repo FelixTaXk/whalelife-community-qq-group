@@ -1,9 +1,9 @@
 {
-  "version": "0.6.7",
+  "version": "0.6.9",
   "mode": "external",
   "files": [
     {
-      "sha256": "78de36ae862144df302ffdf3079e047fa15c56d367e1ac8bc2bf6458fd015764",
+      "sha256": "ce81b07e06045f3457546227bf4088304d2f6bf38969ddc7fe91badef0bf4abc",
       "path": "index.ts"
     },
     {
@@ -19,11 +19,11 @@
       "path": "NOTICE.md"
     },
     {
-      "sha256": "7e8ce299e86d653f35820db6b950c1e80c7668bc01f7586b2dae38a669769f06",
+      "sha256": "7071e6328547729576c2c9be069679df61f22e56ab09f63f708a82e9b8e4304a",
       "path": "plugin.yaml"
     },
     {
-      "sha256": "7c8b1cf44bc9d1552480cb510e1409cddecc07e11fa1e88357044feadfa83034",
+      "sha256": "dd8e2f4bf7dcb5ed15e3d6160ce09c5c0cdf6159f0c40ef09aa80d11205f3c21",
       "path": "README.md"
     },
     {
