@@ -96,21 +96,26 @@ function splitReply(text, max = 1200, options = {}) {
       }
     }
     if (best < 0) break;
-    blocks.splice(best, 2, blocks[best] + "\n" + blocks[best + 1]);
+    blocks.splice(best, 2, blocks[best] + blocks[best + 1]);
   }
   while (blocks.length > limit) {
     const last = blocks.pop();
-    blocks[blocks.length - 1] += "\n" + last;
+    blocks[blocks.length - 1] += last;
   }
   return blocks.filter(Boolean);
 }
 
 function normalizeActionId(value, fallback) {
   const text = String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, "").trim();
-  return (text || fallback).slice(0, 128);
+  return text || fallback;
+}
+function requestActionId(base, groupId, body, targets = [], replyTo = "") {
+  return "qq-group:" + createHash("sha256")
+    .update(JSON.stringify([String(base), String(groupId), String(body), targets, String(replyTo)]))
+    .digest("hex");
 }
 function segmentActionId(base, suffix) {
-  return `${String(base).slice(0, 100)}:${suffix}`.slice(0, 128);
+  return `qq-group:${createHash("sha256").update(String(base)).digest("hex")}:${suffix}`.slice(0, 128);
 }
 function validReceiptId(value) {
   return typeof value === "string" && /^-?[1-9]\d{0,19}$/.test(value);
@@ -376,6 +381,7 @@ class GroupRuntime {
     this.buffers = new Map();
     this.queues = new Map();
     this.timers = new Map();
+    this.sendReceipts = new Map();
     this.judging = new Set();
     this.selfId = "";
     this.groupNames = new Map();
@@ -398,6 +404,7 @@ class GroupRuntime {
     this.closeChannels();
     this.clearTimers();
     if (!this.config.enabled) return;
+    this.watch();
     const account = this.qq.getSelfId?.() || "";
     this.selfId = /^[1-9]\d{4,19}$/.test(account) ? account : "";
     if (!this.selfId) {
@@ -542,7 +549,7 @@ class GroupRuntime {
   async setMemberTags(groupId, rows) {
     const group = groupIdOf(groupId);
     if (!this.ruleFor(group)) throw new Error("这个群还没有加入群聊白名单。");
-    if (!Array.isArray(rows) || rows.length > 200) throw new Error("标签列表无效。");
+    if (!Array.isArray(rows) || rows.length > 5000) throw new Error("标签列表无效。");
     const members = await this.membersOf(group);
     const valid = new Set(members.map((member) => member.userId));
     const next = { ...this.tagsFor(group) };
@@ -758,6 +765,22 @@ class GroupRuntime {
     this.buffers.set(groupId, list);
   }
 
+  storeSendReceipt(deliveryId, result) {
+    if (typeof deliveryId !== "string" || !deliveryId) return;
+    if (!confirmedSend(result)) return;
+    this.sendReceipts.set(deliveryId, {
+      status: "sent",
+      confirmed: true,
+      messageId: result.messageId || receiptIds(result)[0],
+      ...(Array.isArray(result.messageIds) ? { messageIds: receiptIds(result) } : {})
+    });
+    while (this.sendReceipts.size > 64) this.sendReceipts.delete(this.sendReceipts.keys().next().value);
+  }
+
+  sendReceipt(deliveryId) {
+    return typeof deliveryId === "string" ? this.sendReceipts.get(deliveryId) : void 0;
+  }
+
   onEvent(event) {
     if (!this.config.enabled || !this.hasChannel()) return;
     const rule = this.ruleFor(event.groupId);
@@ -797,16 +820,6 @@ class GroupRuntime {
   reply(event) {
     const rule = this.ruleFor(event.groupId);
     if (!rule) return;
-    let channel;
-    try {
-      channel = this.channelFor(rule);
-    } catch (error) {
-      this.ctx.logger.warn("QQ 群渠道接入失败，本条未回复", {
-        groupId: event.groupId,
-        error: error instanceof Error ? error.message : "unknown"
-      });
-      return;
-    }
     const peer = peerOf(event.groupId);
     const quote = /^-?[1-9]\d{0,19}$/.test(String(event.messageId)) ? String(event.messageId) : "";
     const message = {
@@ -822,6 +835,21 @@ class GroupRuntime {
       }
     };
     this.chain(event.groupId, async () => {
+      const currentRule = this.ruleFor(event.groupId);
+      if (!this.config.enabled || !currentRule) {
+        this.ctx.logger.info("QQ 群消息已撤权，丢弃排队消息", { groupId: event.groupId, messageId: event.messageId });
+        return;
+      }
+      let channel;
+      try {
+        channel = this.channelFor(currentRule);
+      } catch (error) {
+        this.ctx.logger.warn("QQ 群渠道接入失败，本条未回复", {
+          groupId: event.groupId,
+          error: error instanceof Error ? error.message : "unknown"
+        });
+        return;
+      }
       const result = await channel.receive(message, { signal: this.ctx.signal });
       if (result.status === "sent") this.markFollowup(event.groupId, event.sender);
       else
@@ -847,7 +875,12 @@ class GroupRuntime {
   }
 
   schedule(rule) {
-    if (!this.config.proactive.enabled || this.config.permission !== "full" || this.timers.has(rule.groupId)) return;
+    if (!this.config.proactive.enabled || this.config.permission !== "full") return;
+    const existing = this.timers.get(rule.groupId);
+    if (existing) {
+      clearTimeout(existing);
+      this.timers.delete(rule.groupId);
+    }
     const timer = setTimeout(() => {
       this.timers.delete(rule.groupId);
       void this.judge(rule);
@@ -860,6 +893,7 @@ class GroupRuntime {
     if (this.judging.has(rule.groupId) || this.judging.size >= 4) return;
     const proactive = this.config.proactive;
     if (!proactive.enabled || !this.hasChannel() || this.config.permission !== "full") return;
+    if (!this.ruleFor(rule.groupId)) return;
     const now = new Date();
     if (inQuietHours(now, proactive.quietStart, proactive.quietEnd)) return;
     const entry = this.state.groups[rule.groupId] ?? { day: "", count: 0, lastSpokenAt: 0 };
@@ -932,9 +966,12 @@ class GroupRuntime {
     const replyTo = typeof message.replyTo === "string" ? message.replyTo : "";
     const rawText = String(message.text ?? "");
     const text = stripSendReceipt(rawText);
-    const baseActionId = normalizeActionId(
-      message.actionId,
-      "group-channel:" + difference(groupId, message.deliveryId || message.messageId || "")
+    const baseActionId = requestActionId(
+      normalizeActionId(message.actionId, "group-channel:" + difference(groupId, message.deliveryId || message.messageId || "")),
+      groupId,
+      text,
+      [],
+      replyTo
     );
     const chunks = splitReply(text, this.config.maxChars, {
       paragraph: this.config.splitParagraphs,
@@ -950,7 +987,8 @@ class GroupRuntime {
     const replace = due && voice.mode === "replace" && Array.from(text).length <= voice.maxChars;
     if (replace) {
       try {
-        await this.sendVoice(groupId, text, signal, true, segmentActionId(baseActionId, "voice-replace"));
+        const sent = await this.sendVoice(groupId, text, signal, true, segmentActionId(baseActionId, "voice-replace"));
+        this.storeSendReceipt(message.deliveryId, sent);
         if (!replyTo) this.markSpoken(groupId);
         return;
       } catch (error) {
@@ -967,6 +1005,7 @@ class GroupRuntime {
           this.ctx.logger.warn("QQ 群语音未提交，改发文字", { groupId, error: error instanceof Error ? error.message : "unknown" });
       }
     }
+    const textSegments = [];
     for (const [index, chunk] of chunks.entries()) {
       signal.throwIfAborted();
       const segmentId = segmentActionId(baseActionId, `text-${index}`);
@@ -975,8 +1014,10 @@ class GroupRuntime {
         throw new GroupSendError("群消息未获得平台确认，请核对回执。", result?.status === "not_submitted" ? "not_submitted" : "uncertain", result);
       }
       this.rememberSelf(groupId, chunk);
+      textSegments.push(String(result.messageId));
     }
     this.noteText(groupId);
+    this.storeSendReceipt(message.deliveryId, { status: "sent", confirmed: true, messageId: textSegments[0], messageIds: textSegments });
     if (due) {
       try {
         await this.sendVoice(groupId, text, signal, true, segmentActionId(baseActionId, "voice-extra"));
@@ -1070,11 +1111,16 @@ class GroupRuntime {
 
   async sendVoice(groupId, text, signal, track = true, actionId = "") {
     const service = this.voiceService();
-    if (!service?.synthesize) throw new Error("语音插件未接入，群语音发不出去。");
+    if (!service?.synthesize) throw new GroupSendError("语音插件未接入，群语音发不出去。", "not_submitted");
     const speech = this.speechText(text);
-    if (!speech) throw new Error("这条内容没有可朗读的文字。");
-    const audio = await service.synthesize({ text: speech }, { signal: AbortSignal.any([signal, AbortSignal.timeout(180000)]) });
-    if (!audio?.base64 || !audio?.mime) throw new Error("语音合成没有返回音频。");
+    if (!speech) throw new GroupSendError("这条内容没有可朗读的文字。", "not_submitted");
+    let audio;
+    try {
+      audio = await service.synthesize({ text: speech }, { signal: AbortSignal.any([signal, AbortSignal.timeout(180000)]) });
+    } catch (error) {
+      throw new GroupSendError(error instanceof Error ? error.message : "语音合成失败。", "not_submitted", error);
+    }
+    if (!audio?.base64 || !audio?.mime) throw new GroupSendError("语音合成没有返回音频。", "not_submitted");
     const stableActionId = segmentActionId(
       normalizeActionId(actionId, "group-voice:" + difference(groupId, randomUUID())),
       "voice"
@@ -1232,8 +1278,9 @@ export async function apply(ctx) {
         if (!name) throw new Error(`找不到要 @ 的群成员 ${target}，未发送。`);
       }
     }
+    const baseActionId = requestActionId(actionId, group, body, targets, quote);
     if (targets.length || quote) {
-      const key = `${session.id}:${actionId}`;
+      const key = `${session.id}:${baseActionId}`;
       if (mentionActions.has(key)) return mentionActions.get(key);
       const task = (async () => {
         const chunks = splitReply(body, runtime.config.maxChars, {
@@ -1243,7 +1290,7 @@ export async function apply(ctx) {
         });
         const messageIds = [];
         for (let index = 0; index < chunks.length; index++) {
-          const segmentId = segmentActionId(actionId, `text-${index}`);
+          const segmentId = segmentActionId(baseActionId, `text-${index}`);
           try {
             const sent = await runtime.qq.sendGroupText({ groupId: group, text: chunks[index], actionId: segmentId, atUserIds: index === 0 ? targets : [], ...(index === 0 && quote ? { replyTo: quote } : {}) }, { signal: signalOf(session) });
             if (!confirmedSend(sent)) {
@@ -1281,17 +1328,19 @@ export async function apply(ctx) {
     const peer = peerOf(group);
     const result = await runtime.channelFor(rule).send({
       peer,
-      messageId: `${transient ? "chime" : "say"}:${difference(session.id, actionId)}`,
-      actionId,
+      messageId: `${transient ? "chime" : "say"}:${difference(session.id, baseActionId)}`,
+      actionId: baseActionId,
       ...(quote ? { replyTo: quote } : {}),
       text: body
     }, { signal: signalOf(session) });
-    const confirmed = result.status === "sent" && validReceiptId(result.messageId);
+    const actual = runtime.sendReceipt(result.deliveryId);
+    const confirmed = actual?.status === "sent" && actual?.confirmed === true && validReceiptId(actual.messageId);
     return {
       status: confirmed ? "sent" : "uncertain",
       confirmed,
       groupId: group,
-      messageId: result.messageId,
+      messageId: confirmed ? actual.messageId : undefined,
+      ...(confirmed && Array.isArray(actual?.messageIds) ? { messageIds: actual.messageIds } : {}),
       ...(quote ? { replyTo: quote } : {}),
       ...(confirmed ? {} : { error: result.error || "未获得平台确认，请核对回执。" }),
       retryAutomatically: false
@@ -1536,7 +1585,7 @@ export async function apply(ctx) {
       parts.push({ type: "image", base64: media.base64, mime: media.mime, asMeme: false });
     }
     const promise = (async () => {
-      const mediaActionId = segmentActionId(actionId, "image");
+      const mediaActionId = segmentActionId(requestActionId(actionId, groupId, JSON.stringify(parts)), "image");
       const result = await runtime.qq.sendGroupMedia({ groupId, parts, actionId: mediaActionId }, { signal: signalOf(session) });
       const confirmed = confirmedSend(result);
       return {
@@ -1809,7 +1858,7 @@ td button{padding:4px 8px;font-size:12px}
       const td=document.createElement("td");
       const input=document.createElement("input");
       input.type="text";input.maxLength=80;input.placeholder="例如：小幽的鱼 / 群主";
-      input.value=m.tag||"";input.dataset.uid=m.userId;
+      input.value=m.tag||"";input.dataset.uid=m.userId;input.dataset.original=input.value;
       td.appendChild(input);tr.appendChild(td);body.appendChild(tr);
     }
   };
@@ -1832,11 +1881,12 @@ td button{padding:4px 8px;font-size:12px}
     const gid=byId("memberGroup").value;
     const note=byId("memberMsg");
     if(!gid){note.textContent="先选择一个群。";return;}
-    const rows=[...byId("memberList").querySelectorAll("input[data-uid]")].map(input=>({userId:input.dataset.uid,tag:input.value.trim()}));
-    if(!rows.length){note.textContent="没有可保存的群友。";return;}
+    const rows=[...byId("memberList").querySelectorAll("input[data-uid]")].map(input=>({userId:input.dataset.uid,tag:input.value.trim(),original:input.dataset.original||""})).filter((row)=>row.tag!==row.original).map(({userId,tag})=>({userId,tag}));
+    if(!rows.length){note.style.color="#2f7d4f";note.textContent="没有改动需要保存。";return;}
     byId("memberSave").disabled=true;note.textContent="保存标签中…";
     try{
       await api("tags",{groupId:gid,tags:rows});
+      for(const input of byId("memberList").querySelectorAll("input[data-uid]"))input.dataset.original=input.value.trim();
       note.style.color="#2f7d4f";note.textContent="标签已保存，当前人格下次读群友/群消息时就会看到。";
     }catch(e){
       note.style.color="#b03535";note.textContent="保存失败："+e.message;

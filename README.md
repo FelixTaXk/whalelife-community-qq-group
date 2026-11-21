@@ -10,8 +10,8 @@
 
 ## 发行包
 
-- [qq-group-0.6.7-win32-x64.wlpkg.gz](https://github.com/FelixTaXk/whalelife-community-qq-group/releases/download/v0.6.7/qq-group-0.6.7-win32-x64.wlpkg.gz)
-- SHA-256：`e4be41b8262a9c4121a8e74677a2eb5be26baaf7a0ec0be5b3226db6bc7a2937`
+- [qq-group-0.6.8-win32-x64.wlpkg.gz](https://github.com/FelixTaXk/whalelife-community-qq-group/releases/download/v0.6.8/qq-group-0.6.8-win32-x64.wlpkg.gz)
+- SHA-256 以 Release 页展示为准
 - 适用：WhaleLife `0.1.1`，Windows `x64`，父插件 `qq` `0.24.0`（官方候选/正式版）；本地改版 `0.22.4` 也可运行
 
 ## 启用
