@@ -6,6 +6,12 @@
 >
 > 父插件必须是提供群接口的 QQ 0.22.4（本地改版，`groupApiVersion: "1.0.0"`）；官方 0.23.0 没有群接口，装上也不会启动。安装后在父插件 `plugins/qq/plugin.yaml` 中确认 `sub: [qzone, group]`，再重载 QQ 主插件。
 
+## 发行包
+
+- [qq-group-0.6.6-win32-x64.wlpkg.gz](https://github.com/FelixTaXk/whalelife-community-qq-group/releases/download/v0.6.6/qq-group-0.6.6-win32-x64.wlpkg.gz)
+- SHA-256：`07325003dc7acaf415ac222cf174e3728c6914ef3ca942e35b0278cc7a1b6ac0`
+- 适用：WhaleLife `0.1.0`，Windows `x64`，父插件 `qq` `0.22.4`
+
 ## 启用
 
 1. 在插件页打开 `QQ 群聊` 的设置（`/plugins/qq/group/settings`）。
