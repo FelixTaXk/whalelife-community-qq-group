@@ -860,6 +860,7 @@ class GroupRuntime {
     if (!rule) return;
     const peer = peerOf(event.groupId);
     const quote = /^-?[1-9]\d{0,19}$/.test(String(event.messageId)) ? String(event.messageId) : "";
+    const senderTag = this.tagOf(event.groupId, event.sender);
     const message = {
       peer,
       sender: event.sender,
@@ -869,7 +870,7 @@ class GroupRuntime {
       text: String(event.text || "").slice(0, MAX_TEXT),
       senderProfile: {
         nickname: cleanText(event.card || event.nickname || event.sender, 64),
-        ...(this.tagOf(event.groupId, event.sender) ? { tag: this.tagOf(event.groupId, event.sender) } : {})
+        ...(senderTag ? { remark: `群友标签：${senderTag}` } : {})
       }
     };
     this.chain(event.groupId, async () => {
@@ -1736,10 +1737,13 @@ header p{color:#526c80;margin-top:6px}
 #backTop{position:fixed;right:24px;bottom:24px;z-index:60;display:none;align-items:center;gap:6px;padding:10px 16px;border-radius:999px;box-shadow:0 8px 24px rgba(23,49,74,.22)}
 #backTop.show{display:inline-flex}
 .card{background:#fff;border:1px solid #dce5ed;border-radius:14px;padding:22px;margin:20px 0}
-.row{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-label{display:grid;gap:6px}
+.row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px;align-items:start}
+label{display:grid;gap:6px;min-width:0}
 input[type=text],input[type=number],select,textarea,button{font:inherit;padding:9px 12px;border:1px solid #c5d4df;border-radius:7px;box-sizing:border-box;width:100%;background:#fff;color:#17314a}
-textarea{min-height:110px;resize:vertical;font-family:ui-monospace,Consolas,monospace}
+input[type=text],input[type=number],select{height:40px;min-width:0;line-height:1.5;vertical-align:middle}
+textarea{min-height:110px;height:auto;resize:vertical;font-family:ui-monospace,Consolas,monospace}
+select{cursor:pointer}
+input[type=number]{font-variant-numeric:tabular-nums}
 small{color:#526c80}
 .check{display:flex;align-items:center;gap:9px;margin:8px 0}
 .check input{width:auto}
